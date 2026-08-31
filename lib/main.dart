@@ -91,6 +91,7 @@ class MacReceiverPage extends StatefulWidget {
 class _MacReceiverPageState extends State<MacReceiverPage> {
   HttpServer? _server;
   WebSocket? _socket;
+  Timer? _permissionTimer;
   String _status = 'Başlatılıyor';
   String _usbStatus = 'Type-C tüneli kapalı';
   BridgeMode _mode = BridgeMode.pen;
@@ -105,6 +106,10 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
     super.initState();
     unawaited(_startServer());
     unawaited(_checkPermission());
+    _permissionTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => unawaited(_checkPermission()),
+    );
   }
 
   Future<void> _startServer() async {
@@ -193,9 +198,15 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
   }
 
   Future<void> _checkPermission() async {
-    final trusted =
-        await _channel.invokeMethod<bool>('checkAccessibility') ?? false;
-    if (mounted) setState(() => _accessibility = trusted);
+    try {
+      final trusted =
+          await _channel.invokeMethod<bool>('checkAccessibility') ?? false;
+      if (mounted && trusted != _accessibility) {
+        setState(() => _accessibility = trusted);
+      }
+    } on PlatformException {
+      // The native window may still be attaching during application startup.
+    }
   }
 
   Future<void> _requestPermission() async {
@@ -206,6 +217,7 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
 
   @override
   void dispose() {
+    _permissionTimer?.cancel();
     unawaited(_socket?.close());
     unawaited(_server?.close(force: true));
     super.dispose();
@@ -308,14 +320,16 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
                                       detail: _accessibility
                                           ? 'İzin verildi'
                                           : 'İzin gerekli',
-                                      button: OutlinedButton(
-                                        onPressed: _requestPermission,
-                                        child: Text(
-                                          _accessibility
-                                              ? 'Kontrol et'
-                                              : 'İzin ver',
-                                        ),
-                                      ),
+                                      button: _accessibility
+                                          ? const Icon(
+                                              Icons.check_circle_rounded,
+                                              color: Colors.greenAccent,
+                                              size: 26,
+                                            )
+                                          : OutlinedButton(
+                                              onPressed: _requestPermission,
+                                              child: const Text('İzin ver'),
+                                            ),
                                     ),
                                   ),
                                 ],
