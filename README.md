@@ -37,6 +37,9 @@ flutter run -d <android-device-id>
 
 Press **Bağlan** on the tablet. macOS will ask for Accessibility permission the
 first time input injection is enabled. Restart PenBridge after granting it.
+Local debug builds use ad-hoc signing by default; for a stable Accessibility
+entry, sign the app with your Apple Development certificate or add the built
+`.app` manually with the `+` button in Privacy & Security > Accessibility.
 
 ## Current limitations
 

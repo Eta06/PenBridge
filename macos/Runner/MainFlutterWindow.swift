@@ -30,10 +30,21 @@ final class MainFlutterWindow: NSWindow {
         result(nil)
       case "requestAccessibility":
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        result(AXIsProcessTrustedWithOptions(options))
+        let trusted = AXIsProcessTrustedWithOptions(options)
+        if !trusted {
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+            NSWorkspace.shared.open(url)
+          }
+        }
+        result(trusted)
       default:
         result(FlutterMethodNotImplemented)
       }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+      let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+      _ = AXIsProcessTrustedWithOptions(options)
     }
     super.awakeFromNib()
   }
