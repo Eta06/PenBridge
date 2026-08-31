@@ -9,6 +9,42 @@ import 'package:flutter/services.dart';
 
 const _port = 49321;
 const _channel = MethodChannel('io.penbridge/input');
+const _accent = Color(0xff7c5cff);
+
+enum BridgeMode {
+  pen('pen', 'Kalem', Icons.draw_rounded, 'Basınç ve eğim'),
+  mouse('mouse', 'Mouse', Icons.mouse_rounded, 'Mutlak imleç'),
+  trackpad('trackpad', 'Trackpad', Icons.touch_app_rounded, 'Göreceli hareket'),
+  blender(
+    'blender',
+    'Blender',
+    Icons.view_in_ar_rounded,
+    'Hazır 3D kontroller',
+  );
+
+  const BridgeMode(this.id, this.label, this.icon, this.subtitle);
+  final String id;
+  final String label;
+  final IconData icon;
+  final String subtitle;
+
+  static BridgeMode from(String? value) => values.firstWhere(
+    (mode) => mode.id == value,
+    orElse: () => BridgeMode.pen,
+  );
+}
+
+enum BlenderTool {
+  draw('draw', 'Çiz', Icons.brush_rounded),
+  orbit('orbit', 'Döndür', Icons.threesixty_rounded),
+  pan('pan', 'Kaydır', Icons.open_with_rounded),
+  zoom('zoom', 'Zoom', Icons.zoom_in_rounded);
+
+  const BlenderTool(this.id, this.label, this.icon);
+  final String id;
+  final String label;
+  final IconData icon;
+}
 
 void main() => runApp(const PenBridgeApp());
 
@@ -17,18 +53,27 @@ class PenBridgeApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colors = ColorScheme.fromSeed(
-      seedColor: const Color(0xff7c5cff),
+    final scheme = ColorScheme.fromSeed(
+      seedColor: _accent,
       brightness: Brightness.dark,
-      surface: const Color(0xff111218),
+      surface: const Color(0xff14151a),
     );
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'PenBridge',
       theme: ThemeData(
-        colorScheme: colors,
-        scaffoldBackgroundColor: const Color(0xff090a0e),
+        colorScheme: scheme,
+        scaffoldBackgroundColor: const Color(0xff0b0c10),
+        fontFamily: Platform.isMacOS ? '.AppleSystemUIFont' : null,
         useMaterial3: true,
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 15),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        ),
       ),
       home: Platform.isMacOS
           ? const MacReceiverPage()
@@ -39,7 +84,6 @@ class PenBridgeApp extends StatelessWidget {
 
 class MacReceiverPage extends StatefulWidget {
   const MacReceiverPage({super.key});
-
   @override
   State<MacReceiverPage> createState() => _MacReceiverPageState();
 }
@@ -47,15 +91,20 @@ class MacReceiverPage extends StatefulWidget {
 class _MacReceiverPageState extends State<MacReceiverPage> {
   HttpServer? _server;
   WebSocket? _socket;
-  String _status = 'Alıcı başlatılıyor…';
-  String _usbStatus = 'Type-C tüneli hazır değil';
+  String _status = 'Başlatılıyor';
+  String _usbStatus = 'Type-C tüneli kapalı';
+  BridgeMode _mode = BridgeMode.pen;
   int _packets = 0;
   double _pressure = 0;
+  bool _accessibility = false;
+
+  bool get _connected => _socket != null && _status == 'S Pen bağlı';
 
   @override
   void initState() {
     super.initState();
     unawaited(_startServer());
+    unawaited(_checkPermission());
   }
 
   Future<void> _startServer() async {
@@ -64,28 +113,27 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
       if (mounted) setState(() => _status = 'Tablet bekleniyor');
       await for (final request in _server!) {
         if (!WebSocketTransformer.isUpgradeRequest(request)) {
-          request.response
-            ..statusCode = HttpStatus.upgradeRequired
-            ..write('WebSocket gerekli')
-            ..close();
+          await request.response.close();
           continue;
         }
-        _socket = await WebSocketTransformer.upgrade(request);
+        final socket = await WebSocketTransformer.upgrade(request);
+        _socket = socket;
         if (mounted) setState(() => _status = 'S Pen bağlı');
-        _socket!.listen(
+        socket.listen(
           _receive,
           onDone: () {
-            if (mounted) {
-              setState(() => _status = 'Tablet bağlantısı kesildi');
-            }
+            _socket = null;
+            if (mounted) setState(() => _status = 'Tablet bekleniyor');
           },
           onError: (_) {
+            _socket = null;
             if (mounted) setState(() => _status = 'Bağlantı hatası');
           },
         );
+        _sendMode();
       }
     } catch (error) {
-      if (mounted) setState(() => _status = 'Port açılamadı: $error');
+      if (mounted) setState(() => _status = 'Port hatası');
     }
   }
 
@@ -93,14 +141,27 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
     if (raw is! String) return;
     try {
       final packet = jsonDecode(raw) as Map<String, dynamic>;
+      if (packet['type'] == 'mode') {
+        final incoming = BridgeMode.from(packet['mode'] as String?);
+        if (incoming != _mode && mounted) setState(() => _mode = incoming);
+        return;
+      }
       _packets++;
       _pressure = (packet['pressure'] as num?)?.toDouble() ?? 0;
-      unawaited(_channel.invokeMethod<void>('injectStylus', packet));
+      final incoming = BridgeMode.from(packet['mode'] as String?);
+      if (incoming != _mode) _mode = incoming;
+      unawaited(_channel.invokeMethod<void>('injectInput', packet));
       if (_packets % 4 == 0 && mounted) setState(() {});
-    } catch (_) {
-      // Ignore malformed packets without interrupting the live pen stream.
-    }
+    } catch (_) {}
   }
+
+  void _selectMode(BridgeMode mode) {
+    setState(() => _mode = mode);
+    _sendMode();
+  }
+
+  void _sendMode() =>
+      _socket?.add(jsonEncode({'type': 'mode', 'mode': _mode.id}));
 
   Future<void> _prepareUsb() async {
     setState(() => _usbStatus = 'Tablet aranıyor…');
@@ -123,22 +184,24 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
           'tcp:49321',
         ]);
         if (result.exitCode == 0) {
-          if (mounted) {
-            setState(() => _usbStatus = 'Type-C hazır • port $_port');
-          }
+          if (mounted) setState(() => _usbStatus = 'USB hazır • $_port');
           return;
         }
-      } catch (_) {
-        // Try the next common adb location.
-      }
+      } catch (_) {}
     }
-    if (mounted) {
-      setState(() => _usbStatus = 'Tablet bulunamadı • USB hata ayıklamayı aç');
-    }
+    if (mounted) setState(() => _usbStatus = 'Tablet bulunamadı');
   }
 
-  Future<void> _requestInputPermission() async {
-    await _channel.invokeMethod<void>('requestAccessibility');
+  Future<void> _checkPermission() async {
+    final trusted =
+        await _channel.invokeMethod<bool>('checkAccessibility') ?? false;
+    if (mounted) setState(() => _accessibility = trusted);
+  }
+
+  Future<void> _requestPermission() async {
+    await _channel.invokeMethod<bool>('requestAccessibility');
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await _checkPermission();
   }
 
   @override
@@ -150,65 +213,123 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
 
   @override
   Widget build(BuildContext context) {
-    return _Shell(
-      eyebrow: 'MAC RECEIVER',
-      title: 'S Pen’i Mac’e bağla.',
-      subtitle:
-          'Basınç, hover, eğim ve tuş verisini Type-C üzerinden uygulamalara aktar.',
-      child: Column(
+    return Scaffold(
+      body: Row(
         children: [
-          Row(
-            children: [
-              Expanded(
-                child: _Metric(label: 'BAĞLANTI', value: _status),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: _Metric(label: 'PAKET', value: '$_packets'),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: _Metric(
-                  label: 'BASINÇ',
-                  value: '${(_pressure * 100).round()}%',
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          _Panel(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Text(
-                  _usbStatus,
-                  style: Theme.of(context).textTheme.titleMedium,
-                ),
-                const SizedBox(height: 8),
-                const Text(
-                  'Tableti kabloyla bağla, USB hata ayıklamayı onayla ve iki adımı çalıştır.',
-                ),
-                const SizedBox(height: 20),
-                Row(
-                  children: [
-                    Expanded(
-                      child: FilledButton.icon(
-                        onPressed: _prepareUsb,
-                        icon: const Icon(Icons.usb_rounded),
-                        label: const Text('Type-C bağlantısını hazırla'),
+          _MacSidebar(mode: _mode, onMode: _selectMode),
+          Expanded(
+            child: Container(
+              color: const Color(0xff17181d),
+              child: Column(
+                children: [
+                  const _MacTitleBar(),
+                  Expanded(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.fromLTRB(32, 22, 32, 32),
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 1000),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        '${_mode.label} modu',
+                                        style: Theme.of(
+                                          context,
+                                        ).textTheme.headlineMedium,
+                                      ),
+                                      const SizedBox(height: 6),
+                                      Text(
+                                        _modeDescription(_mode),
+                                        style: const TextStyle(
+                                          color: Colors.white54,
+                                          fontSize: 15,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                _StatusPill(active: _connected, label: _status),
+                              ],
+                            ),
+                            const SizedBox(height: 26),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: _MacMetric(
+                                    icon: Icons.speed_rounded,
+                                    label: 'Paketler',
+                                    value: '$_packets',
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: _PressureMetric(value: _pressure),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: _MacMetric(
+                                    icon: Icons.usb_rounded,
+                                    label: 'Bağlantı',
+                                    value: _usbStatus,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 18),
+                            _MacCard(
+                              title: 'Hızlı kurulum',
+                              subtitle:
+                                  'Tablet ve Mac arasındaki kablolu bağlantıyı hazırla.',
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                    child: _SetupRow(
+                                      number: '1',
+                                      title: 'Type-C tüneli',
+                                      detail: _usbStatus,
+                                      button: FilledButton(
+                                        onPressed: _prepareUsb,
+                                        child: const Text('Hazırla'),
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: _SetupRow(
+                                      number: '2',
+                                      title: 'Mac giriş izni',
+                                      detail: _accessibility
+                                          ? 'İzin verildi'
+                                          : 'İzin gerekli',
+                                      button: OutlinedButton(
+                                        onPressed: _requestPermission,
+                                        child: Text(
+                                          _accessibility
+                                              ? 'Kontrol et'
+                                              : 'İzin ver',
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 18),
+                            _ModeHelp(mode: _mode),
+                          ],
+                        ),
                       ),
                     ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: _requestInputPermission,
-                        icon: const Icon(Icons.mouse_rounded),
-                        label: const Text('Mac giriş iznini aç'),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
+                  ),
+                ],
+              ),
             ),
           ),
         ],
@@ -219,43 +340,67 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
 
 class TabletSenderPage extends StatefulWidget {
   const TabletSenderPage({super.key});
-
   @override
   State<TabletSenderPage> createState() => _TabletSenderPageState();
 }
 
 class _TabletSenderPageState extends State<TabletSenderPage> {
   WebSocket? _socket;
-  String _status = 'Bağlanmaya hazır';
+  BridgeMode _mode = BridgeMode.pen;
+  BlenderTool _tool = BlenderTool.draw;
+  String _status = 'Mac bekleniyor';
   _PenPoint? _pen;
+  Offset? _previous;
   int _lastPaintMicros = 0;
+
+  bool get _connected => _socket != null;
 
   Future<void> _connect() async {
     await _socket?.close();
     setState(() => _status = 'Mac aranıyor…');
     try {
       final socket = await WebSocket.connect('ws://127.0.0.1:$_port');
-      socket.done.whenComplete(() {
-        if (mounted) {
-          setState(() => _status = 'Bağlantı kesildi');
-        }
-      });
-      setState(() {
-        _socket = socket;
-        _status = 'Type-C üzerinden bağlı';
-      });
+      _socket = socket;
+      socket.listen(
+        (raw) {
+          if (raw is String) {
+            final data = jsonDecode(raw) as Map<String, dynamic>;
+            if (data['type'] == 'mode' && mounted) {
+              setState(() => _mode = BridgeMode.from(data['mode'] as String?));
+            }
+          }
+        },
+        onDone: () {
+          _socket = null;
+          if (mounted) setState(() => _status = 'Bağlantı kesildi');
+        },
+      );
+      setState(() => _status = 'USB ile bağlı');
+      _announceMode();
     } catch (_) {
-      if (mounted) {
-        setState(() => _status = 'Mac bulunamadı • önce tüneli hazırla');
-      }
+      _socket = null;
+      if (mounted) setState(() => _status = 'Mac bulunamadı');
     }
   }
+
+  void _selectMode(BridgeMode mode) {
+    setState(() {
+      _mode = mode;
+      _tool = BlenderTool.draw;
+    });
+    _announceMode();
+  }
+
+  void _announceMode() =>
+      _socket?.add(jsonEncode({'type': 'mode', 'mode': _mode.id}));
 
   void _send(PointerEvent event, String action, Size size) {
     if (event.kind != PointerDeviceKind.stylus &&
         event.kind != PointerDeviceKind.invertedStylus) {
       return;
     }
+    final position = event.localPosition;
+    final prior = _previous ?? position;
     final width = math.max(size.width, 1);
     final height = math.max(size.height, 1);
     final range = event.pressureMax - event.pressureMin;
@@ -263,12 +408,13 @@ class _TabletSenderPageState extends State<TabletSenderPage> {
         ? 0.0
         : ((event.pressure - event.pressureMin) / range).clamp(0.0, 1.0);
     final point = _PenPoint(
-      x: (event.localPosition.dx / width).clamp(0.0, 1.0),
-      y: (event.localPosition.dy / height).clamp(0.0, 1.0),
+      x: (position.dx / width).clamp(0.0, 1.0),
+      y: (position.dy / height).clamp(0.0, 1.0),
       pressure: pressure,
       hovering: action == 'hover',
     );
     _pen = point;
+    _previous = action == 'up' ? null : position;
     final micros = event.timeStamp.inMicroseconds;
     if (mounted && micros - _lastPaintMicros >= 16000) {
       _lastPaintMicros = micros;
@@ -276,9 +422,14 @@ class _TabletSenderPageState extends State<TabletSenderPage> {
     }
     _socket?.add(
       jsonEncode({
+        'type': 'pointer',
+        'mode': _mode.id,
+        'tool': _tool.id,
         'action': action,
         'x': point.x,
         'y': point.y,
+        'dx': position.dx - prior.dx,
+        'dy': position.dy - prior.dy,
         'pressure': pressure,
         'tilt': event.tilt,
         'orientation': event.orientation,
@@ -300,55 +451,109 @@ class _TabletSenderPageState extends State<TabletSenderPage> {
     return Scaffold(
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
+          padding: const EdgeInsets.all(18),
+          child: Row(
             children: [
-              Row(
-                children: [
-                  const _Logo(),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+              SizedBox(
+                width: 230,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
                       children: [
+                        const _BrandMark(),
+                        const SizedBox(width: 12),
                         Text(
                           'PenBridge',
                           style: Theme.of(context).textTheme.titleLarge,
                         ),
-                        Text(_status),
                       ],
                     ),
-                  ),
-                  FilledButton.icon(
-                    onPressed: _connect,
-                    icon: const Icon(Icons.cable_rounded),
-                    label: const Text('Bağlan'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              Expanded(
-                child: LayoutBuilder(
-                  builder: (context, constraints) {
-                    final size = constraints.biggest;
-                    return Listener(
-                      behavior: HitTestBehavior.opaque,
-                      onPointerHover: (e) => _send(e, 'hover', size),
-                      onPointerDown: (e) => _send(e, 'down', size),
-                      onPointerMove: (e) => _send(e, 'drag', size),
-                      onPointerUp: (e) => _send(e, 'up', size),
-                      onPointerCancel: (e) => _send(e, 'up', size),
-                      child: CustomPaint(
-                        painter: _PadPainter(_pen),
-                        child: const Center(
-                          child: Text(
-                            'S Pen alanı\nYaklaştır: hover • Dokun: çiz • Bastır: basınç',
-                            textAlign: TextAlign.center,
-                          ),
+                    const SizedBox(height: 28),
+                    const Text('KONTROL MODU', style: _eyebrow),
+                    const SizedBox(height: 10),
+                    for (final mode in BridgeMode.values)
+                      _TabletModeButton(
+                        mode: mode,
+                        selected: mode == _mode,
+                        onTap: () => _selectMode(mode),
+                      ),
+                    const Spacer(),
+                    _StatusPill(active: _connected, label: _status),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        onPressed: _connect,
+                        icon: Icon(
+                          _connected ? Icons.sync_rounded : Icons.cable_rounded,
+                        ),
+                        label: Text(
+                          _connected ? 'Yeniden bağlan' : 'Mac’e bağlan',
                         ),
                       ),
-                    );
-                  },
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 18),
+              Expanded(
+                child: Column(
+                  children: [
+                    if (_mode == BridgeMode.blender) ...[
+                      _BlenderToolbar(
+                        tool: _tool,
+                        onTool: (tool) => setState(() => _tool = tool),
+                      ),
+                      const SizedBox(height: 12),
+                    ],
+                    Expanded(
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          final size = constraints.biggest;
+                          return Listener(
+                            behavior: HitTestBehavior.opaque,
+                            onPointerHover: (e) => _send(e, 'hover', size),
+                            onPointerDown: (e) => _send(e, 'down', size),
+                            onPointerMove: (e) => _send(e, 'drag', size),
+                            onPointerUp: (e) => _send(e, 'up', size),
+                            onPointerCancel: (e) => _send(e, 'up', size),
+                            child: CustomPaint(
+                              painter: _PadPainter(_pen, _mode),
+                              child: Center(
+                                child: IgnorePointer(
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        _mode.icon,
+                                        size: 34,
+                                        color: Colors.white24,
+                                      ),
+                                      const SizedBox(height: 10),
+                                      Text(
+                                        _padTitle(),
+                                        style: Theme.of(
+                                          context,
+                                        ).textTheme.titleMedium,
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        _padHint(),
+                                        style: const TextStyle(
+                                          color: Colors.white38,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -357,111 +562,483 @@ class _TabletSenderPageState extends State<TabletSenderPage> {
       ),
     );
   }
+
+  String _padTitle() => _mode == BridgeMode.blender
+      ? '${_tool.label} aracı'
+      : '${_mode.label} yüzeyi';
+  String _padHint() => switch (_mode) {
+    BridgeMode.pen => 'Hover • basınç • eğim',
+    BridgeMode.mouse => 'Dokunarak tıkla ve sürükle',
+    BridgeMode.trackpad => 'Kalemi göreceli imleç olarak kullan',
+    BridgeMode.blender => 'Üst araç çubuğundan 3D kontrolünü seç',
+  };
 }
 
-class _Shell extends StatelessWidget {
-  const _Shell({
-    required this.eyebrow,
+class _MacSidebar extends StatelessWidget {
+  const _MacSidebar({required this.mode, required this.onMode});
+  final BridgeMode mode;
+  final ValueChanged<BridgeMode> onMode;
+  @override
+  Widget build(BuildContext context) => Container(
+    width: 236,
+    decoration: const BoxDecoration(
+      color: Color(0xff101116),
+      border: Border(right: BorderSide(color: Colors.white10)),
+    ),
+    padding: const EdgeInsets.fromLTRB(14, 48, 14, 18),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 10),
+          child: Row(
+            children: [
+              _BrandMark(),
+              SizedBox(width: 11),
+              Expanded(
+                child: Text(
+                  'PenBridge',
+                  maxLines: 1,
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 34),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 10),
+          child: Text('MODLAR', style: _eyebrow),
+        ),
+        const SizedBox(height: 8),
+        for (final item in BridgeMode.values)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Material(
+              color: item == mode
+                  ? Colors.white.withValues(alpha: .09)
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(9),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(9),
+                onTap: () => onMode(item),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 11,
+                    vertical: 10,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        item.icon,
+                        size: 18,
+                        color: item == mode
+                            ? const Color(0xffb6a8ff)
+                            : Colors.white54,
+                      ),
+                      const SizedBox(width: 11),
+                      Text(item.label),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        const Spacer(),
+        const Padding(
+          padding: EdgeInsets.all(10),
+          child: Text(
+            'USB • Yerel • Açık kaynak',
+            style: TextStyle(color: Colors.white30, fontSize: 12),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class _MacTitleBar extends StatelessWidget {
+  const _MacTitleBar();
+  @override
+  Widget build(BuildContext context) => Container(
+    height: 52,
+    decoration: const BoxDecoration(
+      color: Color(0xff17181d),
+      border: Border(bottom: BorderSide(color: Colors.white10)),
+    ),
+    alignment: Alignment.centerRight,
+    padding: const EdgeInsets.symmetric(horizontal: 18),
+    child: const Text(
+      'Galaxy Tab → Mac',
+      style: TextStyle(color: Colors.white38, fontSize: 12),
+    ),
+  );
+}
+
+class _MacCard extends StatelessWidget {
+  const _MacCard({
     required this.title,
     required this.subtitle,
     required this.child,
   });
-  final String eyebrow;
   final String title;
   final String subtitle;
   final Widget child;
-
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 920),
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(32),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const _Logo(),
-                const SizedBox(height: 40),
-                Text(
-                  eyebrow,
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.primary,
-                    letterSpacing: 2,
-                  ),
-                ),
-                const SizedBox(height: 10),
-                Text(title, style: Theme.of(context).textTheme.displaySmall),
-                const SizedBox(height: 10),
-                Text(subtitle, style: Theme.of(context).textTheme.titleMedium),
-                const SizedBox(height: 32),
-                child,
-              ],
-            ),
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.all(20),
+    decoration: BoxDecoration(
+      color: const Color(0xff202126),
+      border: Border.all(color: Colors.white10),
+      borderRadius: BorderRadius.circular(14),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title, style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(subtitle, style: const TextStyle(color: Colors.white54)),
+        const SizedBox(height: 18),
+        child,
+      ],
+    ),
+  );
+}
+
+class _MacMetric extends StatelessWidget {
+  const _MacMetric({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+  final IconData icon;
+  final String label;
+  final String value;
+  @override
+  Widget build(BuildContext context) => Container(
+    height: 94,
+    padding: const EdgeInsets.all(16),
+    decoration: BoxDecoration(
+      color: const Color(0xff202126),
+      border: Border.all(color: Colors.white10),
+      borderRadius: BorderRadius.circular(14),
+    ),
+    child: Row(
+      children: [
+        Container(
+          width: 38,
+          height: 38,
+          decoration: BoxDecoration(
+            color: _accent.withValues(alpha: .14),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Icon(icon, color: const Color(0xffb6a8ff), size: 20),
+        ),
+        const SizedBox(width: 13),
+        Expanded(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: const TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ],
           ),
         ),
+      ],
+    ),
+  );
+}
+
+class _PressureMetric extends StatelessWidget {
+  const _PressureMetric({required this.value});
+  final double value;
+  @override
+  Widget build(BuildContext context) => _MacMetric(
+    icon: Icons.water_drop_rounded,
+    label: 'Basınç',
+    value: '${(value * 100).round()}%',
+  );
+}
+
+class _SetupRow extends StatelessWidget {
+  const _SetupRow({
+    required this.number,
+    required this.title,
+    required this.detail,
+    required this.button,
+  });
+  final String number;
+  final String title;
+  final String detail;
+  final Widget button;
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(
+      color: Colors.black.withValues(alpha: .12),
+      borderRadius: BorderRadius.circular(11),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            CircleAvatar(
+              radius: 16,
+              backgroundColor: Colors.white10,
+              child: Text(number, style: const TextStyle(fontSize: 12)),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  Text(
+                    detail,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white38, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        button,
+      ],
+    ),
+  );
+}
+
+class _ModeHelp extends StatelessWidget {
+  const _ModeHelp({required this.mode});
+  final BridgeMode mode;
+  @override
+  Widget build(BuildContext context) {
+    final items = switch (mode) {
+      BridgeMode.pen => [
+        ('Kalem ucu', 'Sol tık + basınç'),
+        ('Hover', 'İmleci hareket ettir'),
+        ('Eğim', 'Fırça yönü'),
+      ],
+      BridgeMode.mouse => [
+        ('Kalem ucu', 'Sol tık'),
+        ('Sürükle', 'Sol tuş sürükleme'),
+        ('Konum', 'Ekrana mutlak eşleme'),
+      ],
+      BridgeMode.trackpad => [
+        ('Hareket', 'Göreceli imleç'),
+        ('Dokun', 'Sol tık'),
+        ('Sürükle', 'Seçimi taşı'),
+      ],
+      BridgeMode.blender => [
+        ('Çiz', 'Tablet basıncı'),
+        ('Döndür', 'Orta tuş'),
+        ('Kaydır', 'Shift + orta tuş'),
+        ('Zoom', 'Kaydırma tekeri'),
+      ],
+    };
+    return _MacCard(
+      title: '${mode.label} eşlemeleri',
+      subtitle: mode.subtitle,
+      child: Wrap(
+        spacing: 10,
+        runSpacing: 10,
+        children: [
+          for (final item in items)
+            Container(
+              width: 190,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: .035),
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    item.$1,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    item.$2,
+                    style: const TextStyle(color: Colors.white38, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+        ],
       ),
     );
   }
 }
 
-class _Logo extends StatelessWidget {
-  const _Logo();
+class _TabletModeButton extends StatelessWidget {
+  const _TabletModeButton({
+    required this.mode,
+    required this.selected,
+    required this.onTap,
+  });
+  final BridgeMode mode;
+  final bool selected;
+  final VoidCallback onTap;
   @override
-  Widget build(BuildContext context) => Container(
-    width: 44,
-    height: 44,
-    decoration: BoxDecoration(
-      color: Theme.of(context).colorScheme.primary,
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(bottom: 7),
+    child: Material(
+      color: selected
+          ? _accent.withValues(alpha: .18)
+          : const Color(0xff15161b),
       borderRadius: BorderRadius.circular(13),
-    ),
-    child: const Icon(Icons.draw_rounded, color: Colors.white),
-  );
-}
-
-class _Panel extends StatelessWidget {
-  const _Panel({required this.child});
-  final Widget child;
-  @override
-  Widget build(BuildContext context) => Container(
-    width: double.infinity,
-    padding: const EdgeInsets.all(24),
-    decoration: BoxDecoration(
-      color: const Color(0xff111218),
-      border: Border.all(color: Colors.white10),
-      borderRadius: BorderRadius.circular(20),
-    ),
-    child: child,
-  );
-}
-
-class _Metric extends StatelessWidget {
-  const _Metric({required this.label, required this.value});
-  final String label;
-  final String value;
-  @override
-  Widget build(BuildContext context) => _Panel(
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          label,
-          style: const TextStyle(
-            fontSize: 11,
-            letterSpacing: 1.4,
-            color: Colors.white54,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(13),
+        child: Padding(
+          padding: const EdgeInsets.all(13),
+          child: Row(
+            children: [
+              Icon(
+                mode.icon,
+                color: selected ? const Color(0xffb8aaff) : Colors.white54,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      mode.label,
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    Text(
+                      mode.subtitle,
+                      style: const TextStyle(
+                        color: Colors.white38,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
         ),
-        const SizedBox(height: 8),
-        Text(
-          value,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: Theme.of(context).textTheme.titleMedium,
+      ),
+    ),
+  );
+}
+
+class _BlenderToolbar extends StatelessWidget {
+  const _BlenderToolbar({required this.tool, required this.onTool});
+  final BlenderTool tool;
+  final ValueChanged<BlenderTool> onTool;
+  @override
+  Widget build(BuildContext context) => Container(
+    height: 62,
+    padding: const EdgeInsets.all(8),
+    decoration: BoxDecoration(
+      color: const Color(0xff15161b),
+      borderRadius: BorderRadius.circular(15),
+      border: Border.all(color: Colors.white10),
+    ),
+    child: Row(
+      children: [
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 12),
+          child: Text('BLENDER', style: _eyebrow),
         ),
+        for (final item in BlenderTool.values)
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 3),
+              child: Material(
+                color: item == tool ? _accent : Colors.transparent,
+                borderRadius: BorderRadius.circular(10),
+                child: InkWell(
+                  onTap: () => onTool(item),
+                  borderRadius: BorderRadius.circular(10),
+                  child: Center(
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(item.icon, size: 18),
+                        const SizedBox(width: 7),
+                        Text(item.label),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
       ],
     ),
+  );
+}
+
+class _StatusPill extends StatelessWidget {
+  const _StatusPill({required this.active, required this.label});
+  final bool active;
+  final String label;
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
+    decoration: BoxDecoration(
+      color: (active ? Colors.greenAccent : Colors.white).withValues(
+        alpha: .08,
+      ),
+      borderRadius: BorderRadius.circular(20),
+      border: Border.all(
+        color: (active ? Colors.greenAccent : Colors.white).withValues(
+          alpha: .12,
+        ),
+      ),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 7,
+          height: 7,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: active ? Colors.greenAccent : Colors.white38,
+          ),
+        ),
+        const SizedBox(width: 7),
+        Text(label, style: const TextStyle(fontSize: 12)),
+      ],
+    ),
+  );
+}
+
+class _BrandMark extends StatelessWidget {
+  const _BrandMark();
+  @override
+  Widget build(BuildContext context) => Container(
+    width: 38,
+    height: 38,
+    decoration: BoxDecoration(
+      gradient: const LinearGradient(colors: [_accent, Color(0xffa38dff)]),
+      borderRadius: BorderRadius.circular(11),
+    ),
+    child: const Icon(Icons.draw_rounded, color: Colors.white, size: 20),
   );
 }
 
@@ -479,37 +1056,62 @@ class _PenPoint {
 }
 
 class _PadPainter extends CustomPainter {
-  _PadPainter(this.point);
+  _PadPainter(this.point, this.mode);
   final _PenPoint? point;
-
+  final BridgeMode mode;
   @override
   void paint(Canvas canvas, Size size) {
-    final background = Paint()..color = const Color(0xff111218);
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(24)),
-      background,
+    final rect = RRect.fromRectAndRadius(
+      Offset.zero & size,
+      const Radius.circular(22),
     );
-    final grid = Paint()..color = Colors.white.withValues(alpha: .045);
-    for (double x = 0; x < size.width; x += 40) {
+    canvas.drawRRect(rect, Paint()..color = const Color(0xff14151a));
+    canvas.drawRRect(
+      rect,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1
+        ..color = Colors.white.withValues(alpha: .09),
+    );
+    final grid = Paint()..color = Colors.white.withValues(alpha: .035);
+    for (double x = 32; x < size.width; x += 42) {
       canvas.drawLine(Offset(x, 0), Offset(x, size.height), grid);
     }
-    for (double y = 0; y < size.height; y += 40) {
+    for (double y = 32; y < size.height; y += 42) {
       canvas.drawLine(Offset(0, y), Offset(size.width, y), grid);
     }
     final current = point;
     if (current != null) {
       final center = Offset(current.x * size.width, current.y * size.height);
-      final radius = current.hovering ? 9.0 : 8 + current.pressure * 24;
+      final radius = current.hovering ? 8.0 : 9 + current.pressure * 25;
       canvas.drawCircle(
         center,
         radius,
-        Paint()..color = const Color(0xff7c5cff).withValues(alpha: .28),
+        Paint()..color = _accent.withValues(alpha: .22),
       );
-      canvas.drawCircle(center, 4, Paint()..color = const Color(0xffa996ff));
+      canvas.drawCircle(center, 4, Paint()..color = const Color(0xffc3b8ff));
     }
   }
 
   @override
   bool shouldRepaint(covariant _PadPainter oldDelegate) =>
-      oldDelegate.point != point;
+      oldDelegate.point != point || oldDelegate.mode != mode;
 }
+
+String _modeDescription(BridgeMode mode) => switch (mode) {
+  BridgeMode.pen =>
+    'S Pen’i basınç ve eğim destekli grafik tablet olarak kullan.',
+  BridgeMode.mouse =>
+    'Tablet yüzeyini Mac ekranına birebir eşlenmiş mouse olarak kullan.',
+  BridgeMode.trackpad =>
+    'Kalem hareketini konumdan bağımsız, hassas trackpad hareketine çevir.',
+  BridgeMode.blender =>
+    'Sculpt, Grease Pencil, orbit, pan ve zoom için hazır Blender profili.',
+};
+
+const _eyebrow = TextStyle(
+  color: Colors.white38,
+  fontSize: 10,
+  fontWeight: FontWeight.w700,
+  letterSpacing: 1.4,
+);

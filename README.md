@@ -11,6 +11,15 @@ Blender, drawing tools and other tablet-aware Mac applications.
 - `adb reverse` carries the local WebSocket stream over USB; no Wi-Fi is used.
 - The macOS app converts packets into Quartz tablet/mouse events.
 
+## Input modes
+
+- **Pen:** absolute tablet mapping with hover, pressure and tilt.
+- **Mouse:** absolute cursor mapping with click and drag.
+- **Trackpad:** relative cursor movement with adjustable-feeling acceleration.
+- **Blender:** pressure drawing plus dedicated Orbit, Pan and Zoom tools. Orbit
+  emits middle-mouse drag, Pan emits Shift + middle-mouse drag, and Zoom emits
+  scroll-wheel events.
+
 ## Requirements
 
 - macOS 13 or newer

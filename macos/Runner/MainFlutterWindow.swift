@@ -4,8 +4,9 @@ import ApplicationServices
 
 final class MainFlutterWindow: NSWindow {
   private var channel: FlutterMethodChannel?
-  private var penIsDown = false
+  private var pointerIsDown = false
   private var inProximity = false
+  private var relativeLocation = NSEvent.mouseLocation
   private let deviceID: Int64 = 0x5042
 
   override func awakeFromNib() {
@@ -15,26 +16,24 @@ final class MainFlutterWindow: NSWindow {
     setFrame(windowFrame, display: true)
     RegisterGeneratedPlugins(registry: controller)
 
-    channel = FlutterMethodChannel(
-      name: "io.penbridge/input",
-      binaryMessenger: controller.engine.binaryMessenger
-    )
+    channel = FlutterMethodChannel(name: "io.penbridge/input", binaryMessenger: controller.engine.binaryMessenger)
     channel?.setMethodCallHandler { [weak self] call, result in
       switch call.method {
-      case "injectStylus":
+      case "injectInput":
         guard let packet = call.arguments as? [String: Any] else {
-          result(FlutterError(code: "bad_packet", message: "Invalid stylus packet", details: nil))
+          result(FlutterError(code: "bad_packet", message: "Invalid input packet", details: nil))
           return
         }
         self?.inject(packet)
         result(nil)
+      case "checkAccessibility":
+        result(AXIsProcessTrusted())
       case "requestAccessibility":
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         let trusted = AXIsProcessTrustedWithOptions(options)
         if !trusted {
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
-            NSWorkspace.shared.open(url)
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
           }
         }
         result(trusted)
@@ -50,60 +49,84 @@ final class MainFlutterWindow: NSWindow {
   }
 
   private func inject(_ packet: [String: Any]) {
-    guard
-      let x = (packet["x"] as? NSNumber)?.doubleValue,
-      let y = (packet["y"] as? NSNumber)?.doubleValue,
-      let action = packet["action"] as? String
-    else { return }
+    guard let action = packet["action"] as? String else { return }
+    let mode = packet["mode"] as? String ?? "pen"
+    let tool = packet["tool"] as? String ?? "draw"
+    let absolute = absolutePoint(packet)
+    let location = mode == "trackpad" ? relativePoint(packet) : absolute
 
+    if mode == "blender" && tool == "zoom" {
+      if action == "drag", let dy = (packet["dy"] as? NSNumber)?.doubleValue {
+        postScroll(delta: dy)
+      }
+      return
+    }
+
+    let tablet = mode == "pen" || (mode == "blender" && tool == "draw")
+    let middle = mode == "blender" && (tool == "orbit" || tool == "pan")
+    let button: CGMouseButton = middle ? .center : .left
+    let type = mouseType(action: action, middle: middle)
+    guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: location, mouseButton: button) else { return }
+
+    if mode == "blender" && tool == "pan" { event.flags.insert(.maskShift) }
+    if tablet { applyTabletFields(event, packet: packet, location: location) }
+    event.post(tap: .cghidEventTap)
+  }
+
+  private func mouseType(action: String, middle: Bool) -> CGEventType {
+    switch action {
+    case "down":
+      pointerIsDown = true
+      return middle ? .otherMouseDown : .leftMouseDown
+    case "up":
+      pointerIsDown = false
+      return middle ? .otherMouseUp : .leftMouseUp
+    case "drag":
+      guard pointerIsDown else { return .mouseMoved }
+      return middle ? .otherMouseDragged : .leftMouseDragged
+    default:
+      return .mouseMoved
+    }
+  }
+
+  private func absolutePoint(_ packet: [String: Any]) -> CGPoint {
+    let x = (packet["x"] as? NSNumber)?.doubleValue ?? 0
+    let y = (packet["y"] as? NSNumber)?.doubleValue ?? 0
+    let bounds = CGDisplayBounds(CGMainDisplayID())
+    return CGPoint(x: bounds.minX + x * bounds.width, y: bounds.minY + y * bounds.height)
+  }
+
+  private func relativePoint(_ packet: [String: Any]) -> CGPoint {
+    let bounds = CGDisplayBounds(CGMainDisplayID())
+    let dx = (packet["dx"] as? NSNumber)?.doubleValue ?? 0
+    let dy = (packet["dy"] as? NSNumber)?.doubleValue ?? 0
+    relativeLocation.x = min(bounds.maxX, max(bounds.minX, relativeLocation.x + dx * 1.45))
+    relativeLocation.y = min(bounds.maxY, max(bounds.minY, relativeLocation.y + dy * 1.45))
+    return relativeLocation
+  }
+
+  private func applyTabletFields(_ event: CGEvent, packet: [String: Any], location: CGPoint) {
     let pressure = (packet["pressure"] as? NSNumber)?.doubleValue ?? 0
     let tilt = (packet["tilt"] as? NSNumber)?.doubleValue ?? 0
     let orientation = (packet["orientation"] as? NSNumber)?.doubleValue ?? 0
     let buttons = (packet["buttons"] as? NSNumber)?.int64Value ?? 0
     let inverted = (packet["inverted"] as? NSNumber)?.boolValue ?? false
-    let bounds = CGDisplayBounds(CGMainDisplayID())
-    let location = CGPoint(
-      x: bounds.minX + x * bounds.width,
-      y: bounds.minY + y * bounds.height
-    )
-
     if !inProximity { postProximity(entering: true, inverted: inverted) }
-
-    let type: CGEventType
-    switch action {
-    case "down":
-      type = .leftMouseDown
-      penIsDown = true
-    case "up":
-      type = .leftMouseUp
-      penIsDown = false
-    case "drag":
-      type = penIsDown ? .leftMouseDragged : .mouseMoved
-    default:
-      type = .mouseMoved
-    }
-
-    guard let event = CGEvent(
-      mouseEventSource: nil,
-      mouseType: type,
-      mouseCursorPosition: location,
-      mouseButton: .left
-    ) else { return }
-
-    let altitude = max(0, min(.pi / 2, .pi / 2 - tilt))
-    let tiltMagnitude = cos(altitude)
-    let tiltX = tiltMagnitude * cos(orientation)
-    let tiltY = tiltMagnitude * sin(orientation)
-
+    let magnitude = sin(max(0, min(.pi / 2, tilt)))
     event.setIntegerValueField(.mouseEventSubtype, value: 1)
     event.setDoubleValueField(.mouseEventPressure, value: pressure)
     event.setIntegerValueField(.tabletEventPointX, value: Int64(location.x))
     event.setIntegerValueField(.tabletEventPointY, value: Int64(location.y))
     event.setIntegerValueField(.tabletEventPointButtons, value: buttons)
     event.setDoubleValueField(.tabletEventPointPressure, value: pressure)
-    event.setDoubleValueField(.tabletEventTiltX, value: tiltX)
-    event.setDoubleValueField(.tabletEventTiltY, value: tiltY)
+    event.setDoubleValueField(.tabletEventTiltX, value: magnitude * cos(orientation))
+    event.setDoubleValueField(.tabletEventTiltY, value: magnitude * sin(orientation))
     event.setIntegerValueField(.tabletEventDeviceID, value: deviceID)
+  }
+
+  private func postScroll(delta: Double) {
+    let amount = Int32(max(-12, min(12, delta.rounded())))
+    guard amount != 0, let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: amount, wheel2: 0, wheel3: 0) else { return }
     event.post(tap: .cghidEventTap)
   }
 
