@@ -106,6 +106,7 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
   String _status = 'Başlatılıyor';
   String _usbStatus = 'Type-C tüneli kapalı';
   BridgeMode _mode = BridgeMode.pen;
+  double _displayAspectRatio = 16 / 10;
   int _packets = 0;
   double _pressure = 0;
   bool _accessibility = false;
@@ -117,6 +118,7 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
     super.initState();
     unawaited(_startServer());
     unawaited(_checkPermission());
+    unawaited(_loadDisplayAspectRatio());
     _permissionTimer = Timer.periodic(
       const Duration(seconds: 1),
       (_) => unawaited(_checkPermission()),
@@ -196,8 +198,25 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
     _sendMode();
   }
 
-  void _sendMode() =>
-      _socket?.add(jsonEncode({'type': 'mode', 'mode': _mode.id}));
+  void _sendMode() => _socket?.add(
+    jsonEncode({
+      'type': 'mode',
+      'mode': _mode.id,
+      'aspectRatio': _displayAspectRatio,
+    }),
+  );
+
+  Future<void> _loadDisplayAspectRatio() async {
+    try {
+      final ratio = await _channel.invokeMethod<double>('displayAspectRatio');
+      if (ratio != null && ratio > 0) {
+        _displayAspectRatio = ratio;
+        _sendMode();
+      }
+    } on PlatformException {
+      // Keep the safe 16:10 fallback if the native display is not ready yet.
+    }
+  }
 
   Future<void> _prepareUsb() async {
     setState(() => _usbStatus = 'Tablet aranıyor…');
@@ -465,6 +484,8 @@ class _TabletSenderPageState extends State<TabletSenderPage> {
   WebSocket? _socket;
   BridgeMode _mode = BridgeMode.pen;
   BlenderTool _tool = BlenderTool.draw;
+  double _targetAspectRatio = 16 / 10;
+  double _padScale = 0.88;
   String _status = 'Mac bekleniyor';
   _PenPoint? _pen;
   Offset? _previous;
@@ -483,7 +504,11 @@ class _TabletSenderPageState extends State<TabletSenderPage> {
           if (raw is String) {
             final data = jsonDecode(raw) as Map<String, dynamic>;
             if (data['type'] == 'mode' && mounted) {
-              setState(() => _mode = BridgeMode.from(data['mode'] as String?));
+              setState(() {
+                _mode = BridgeMode.from(data['mode'] as String?);
+                final ratio = (data['aspectRatio'] as num?)?.toDouble();
+                if (ratio != null && ratio > 0) _targetAspectRatio = ratio;
+              });
             }
           }
         },
@@ -508,8 +533,13 @@ class _TabletSenderPageState extends State<TabletSenderPage> {
     _announceMode();
   }
 
-  void _announceMode() =>
-      _socket?.add(jsonEncode({'type': 'mode', 'mode': _mode.id}));
+  void _announceMode() => _socket?.add(
+    jsonEncode({
+      'type': 'mode',
+      'mode': _mode.id,
+      'aspectRatio': _targetAspectRatio,
+    }),
+  );
 
   void _send(PointerEvent event, String action, Size size) {
     if (event.kind != PointerDeviceKind.stylus &&
@@ -615,6 +645,12 @@ class _TabletSenderPageState extends State<TabletSenderPage> {
               Expanded(
                 child: Column(
                   children: [
+                    _PadControlBar(
+                      scale: _padScale,
+                      aspectRatio: _targetAspectRatio,
+                      onChanged: (value) => setState(() => _padScale = value),
+                    ),
+                    const SizedBox(height: 12),
                     if (_mode == BridgeMode.blender) ...[
                       _BlenderToolbar(
                         tool: _tool,
@@ -625,41 +661,55 @@ class _TabletSenderPageState extends State<TabletSenderPage> {
                     Expanded(
                       child: LayoutBuilder(
                         builder: (context, constraints) {
-                          final size = constraints.biggest;
-                          return Listener(
-                            behavior: HitTestBehavior.opaque,
-                            onPointerHover: (e) => _send(e, 'hover', size),
-                            onPointerDown: (e) => _send(e, 'down', size),
-                            onPointerMove: (e) => _send(e, 'drag', size),
-                            onPointerUp: (e) => _send(e, 'up', size),
-                            onPointerCancel: (e) => _send(e, 'up', size),
-                            child: CustomPaint(
-                              painter: _PadPainter(_pen, _mode),
-                              child: Center(
-                                child: IgnorePointer(
-                                  child: Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Icon(
-                                        _mode.icon,
-                                        size: 34,
-                                        color: Colors.white24,
+                          final available = constraints.biggest;
+                          var width = available.width * _padScale;
+                          var height = width / _targetAspectRatio;
+                          final maxHeight = available.height * _padScale;
+                          if (height > maxHeight) {
+                            height = maxHeight;
+                            width = height * _targetAspectRatio;
+                          }
+                          final size = Size(width, height);
+                          return Center(
+                            child: SizedBox(
+                              width: width,
+                              height: height,
+                              child: Listener(
+                                behavior: HitTestBehavior.opaque,
+                                onPointerHover: (e) => _send(e, 'hover', size),
+                                onPointerDown: (e) => _send(e, 'down', size),
+                                onPointerMove: (e) => _send(e, 'drag', size),
+                                onPointerUp: (e) => _send(e, 'up', size),
+                                onPointerCancel: (e) => _send(e, 'up', size),
+                                child: CustomPaint(
+                                  painter: _PadPainter(_pen, _mode),
+                                  child: Center(
+                                    child: IgnorePointer(
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(
+                                            _mode.icon,
+                                            size: 34,
+                                            color: Colors.white24,
+                                          ),
+                                          const SizedBox(height: 10),
+                                          Text(
+                                            _padTitle(),
+                                            style: Theme.of(
+                                              context,
+                                            ).textTheme.titleMedium,
+                                          ),
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            _padHint(),
+                                            style: const TextStyle(
+                                              color: Colors.white38,
+                                            ),
+                                          ),
+                                        ],
                                       ),
-                                      const SizedBox(height: 10),
-                                      Text(
-                                        _padTitle(),
-                                        style: Theme.of(
-                                          context,
-                                        ).textTheme.titleMedium,
-                                      ),
-                                      const SizedBox(height: 4),
-                                      Text(
-                                        _padHint(),
-                                        style: const TextStyle(
-                                          color: Colors.white38,
-                                        ),
-                                      ),
-                                    ],
+                                    ),
                                   ),
                                 ),
                               ),
@@ -901,6 +951,54 @@ class _ModeHelp extends StatelessWidget {
       ),
     );
   }
+}
+
+class _PadControlBar extends StatelessWidget {
+  const _PadControlBar({
+    required this.scale,
+    required this.aspectRatio,
+    required this.onChanged,
+  });
+  final double scale;
+  final double aspectRatio;
+  final ValueChanged<double> onChanged;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    height: 58,
+    padding: const EdgeInsets.symmetric(horizontal: 15),
+    decoration: BoxDecoration(
+      color: const Color(0xff15161b),
+      borderRadius: BorderRadius.circular(15),
+      border: Border.all(color: Colors.white10),
+    ),
+    child: Row(
+      children: [
+        const Icon(Icons.aspect_ratio_rounded, size: 19, color: Colors.white54),
+        const SizedBox(width: 9),
+        Text(
+          'Mac oranı  ${aspectRatio.toStringAsFixed(2)}:1',
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+        const Spacer(),
+        const Icon(Icons.remove_rounded, size: 18, color: Colors.white38),
+        SizedBox(
+          width: 190,
+          child: Slider(value: scale, min: .45, max: 1, onChanged: onChanged),
+        ),
+        const Icon(Icons.add_rounded, size: 18, color: Colors.white38),
+        const SizedBox(width: 10),
+        SizedBox(
+          width: 38,
+          child: Text(
+            '${(scale * 100).round()}%',
+            textAlign: TextAlign.end,
+            style: const TextStyle(color: Colors.white54, fontSize: 12),
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 class _TabletModeButton extends StatelessWidget {

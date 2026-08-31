@@ -23,6 +23,9 @@ Blender, drawing tools and other tablet-aware Mac applications.
   emits middle-mouse drag, Pan emits Shift + middle-mouse drag, and Zoom emits
   scroll-wheel events.
 
+The tablet pad automatically adopts the Mac display aspect ratio and can be
+resized from 45% to 100% without changing coordinate accuracy.
+
 ## Requirements
 
 - macOS 13 or newer

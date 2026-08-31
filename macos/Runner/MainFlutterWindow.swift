@@ -6,7 +6,7 @@ final class MainFlutterWindow: NSWindow {
   private var channel: FlutterMethodChannel?
   private var pointerIsDown = false
   private var inProximity = false
-  private var relativeLocation = NSEvent.mouseLocation
+  private var relativeLocation = CGEvent(source: nil)?.location ?? .zero
   private let deviceID: Int64 = 0x5042
 
   override func awakeFromNib() {
@@ -35,6 +35,9 @@ final class MainFlutterWindow: NSWindow {
         result(nil)
       case "checkAccessibility":
         result(AXIsProcessTrusted())
+      case "displayAspectRatio":
+        let bounds = CGDisplayBounds(CGMainDisplayID())
+        result(Double(bounds.width / bounds.height))
       case "requestAccessibility":
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         let trusted = AXIsProcessTrustedWithOptions(options)
@@ -101,7 +104,10 @@ final class MainFlutterWindow: NSWindow {
     let mode = packet["mode"] as? String ?? "pen"
     let tool = packet["tool"] as? String ?? "draw"
     let absolute = absolutePoint(packet)
-    let location = mode == "trackpad" ? relativePoint(packet) : absolute
+    let navigation = mode == "blender" && tool != "draw"
+    let location = (mode == "trackpad" || navigation)
+      ? relativePoint(packet, reset: action == "down")
+      : absolute
 
     if mode == "blender" && tool == "zoom" {
       if action == "drag", let dy = (packet["dy"] as? NSNumber)?.doubleValue {
@@ -117,8 +123,22 @@ final class MainFlutterWindow: NSWindow {
     guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: location, mouseButton: button) else { return }
 
     if mode == "blender" && tool == "pan" { event.flags.insert(.maskShift) }
+    let dx = (packet["dx"] as? NSNumber)?.doubleValue ?? 0
+    let dy = (packet["dy"] as? NSNumber)?.doubleValue ?? 0
+    event.setIntegerValueField(.mouseEventDeltaX, value: eventDelta(dx))
+    event.setIntegerValueField(.mouseEventDeltaY, value: eventDelta(dy))
+    if middle {
+      event.setIntegerValueField(.mouseEventButtonNumber, value: 2)
+      if action == "down" { event.setIntegerValueField(.mouseEventClickState, value: 1) }
+    }
     if tablet { applyTabletFields(event, packet: packet, location: location) }
     event.post(tap: .cghidEventTap)
+  }
+
+  private func eventDelta(_ value: Double) -> Int64 {
+    guard value != 0 else { return 0 }
+    let rounded = Int64(value.rounded())
+    return rounded == 0 ? (value > 0 ? 1 : -1) : rounded
   }
 
   private func mouseType(action: String, middle: Bool) -> CGEventType {
@@ -144,8 +164,11 @@ final class MainFlutterWindow: NSWindow {
     return CGPoint(x: bounds.minX + x * bounds.width, y: bounds.minY + y * bounds.height)
   }
 
-  private func relativePoint(_ packet: [String: Any]) -> CGPoint {
+  private func relativePoint(_ packet: [String: Any], reset: Bool) -> CGPoint {
     let bounds = CGDisplayBounds(CGMainDisplayID())
+    if reset, let current = CGEvent(source: nil)?.location {
+      relativeLocation = current
+    }
     let dx = (packet["dx"] as? NSNumber)?.doubleValue ?? 0
     let dy = (packet["dy"] as? NSNumber)?.doubleValue ?? 0
     relativeLocation.x = min(bounds.maxX, max(bounds.minX, relativeLocation.x + dx * 1.45))
