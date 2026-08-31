@@ -2,10 +2,13 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/gestures.dart';
+import 'package:flutter/cupertino.dart' show CupertinoIcons;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:macos_ui/macos_ui.dart' as mac;
 
 const _port = 49321;
 const _channel = MethodChannel('io.penbridge/input');
@@ -53,6 +56,14 @@ class PenBridgeApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (Platform.isMacOS) {
+      return mac.MacosApp(
+        debugShowCheckedModeBanner: false,
+        title: 'PenBridge',
+        theme: mac.MacosThemeData.dark(),
+        home: const MacReceiverPage(),
+      );
+    }
     final scheme = ColorScheme.fromSeed(
       seedColor: _accent,
       brightness: Brightness.dark,
@@ -75,9 +86,7 @@ class PenBridgeApp extends StatelessWidget {
           ),
         ),
       ),
-      home: Platform.isMacOS
-          ? const MacReceiverPage()
-          : const TabletSenderPage(),
+      home: const TabletSenderPage(),
     );
   }
 }
@@ -92,6 +101,8 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
   HttpServer? _server;
   WebSocket? _socket;
   Timer? _permissionTimer;
+  Timer? _batchTimer;
+  final BytesBuilder _inputBatch = BytesBuilder(copy: false);
   String _status = 'Başlatılıyor';
   String _usbStatus = 'Type-C tüneli kapalı';
   BridgeMode _mode = BridgeMode.pen;
@@ -143,6 +154,19 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
   }
 
   void _receive(dynamic raw) {
+    if (raw is List<int>) {
+      final packet = raw is Uint8List ? raw : Uint8List.fromList(raw);
+      if (packet.lengthInBytes != 40) return;
+      final view = ByteData.sublistView(packet);
+      _packets++;
+      _mode =
+          BridgeMode.values[packet[1].clamp(0, BridgeMode.values.length - 1)];
+      _pressure = view.getFloat32(20, Endian.little);
+      _inputBatch.add(packet);
+      _batchTimer ??= Timer(const Duration(milliseconds: 4), _flushInputBatch);
+      if (_packets % 8 == 0 && mounted) setState(() {});
+      return;
+    }
     if (raw is! String) return;
     try {
       final packet = jsonDecode(raw) as Map<String, dynamic>;
@@ -158,6 +182,13 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
       unawaited(_channel.invokeMethod<void>('injectInput', packet));
       if (_packets % 4 == 0 && mounted) setState(() {});
     } catch (_) {}
+  }
+
+  void _flushInputBatch() {
+    _batchTimer = null;
+    if (_inputBatch.length == 0) return;
+    final bytes = _inputBatch.takeBytes();
+    unawaited(_channel.invokeMethod<void>('injectBatch', bytes));
   }
 
   void _selectMode(BridgeMode mode) {
@@ -218,6 +249,8 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
   @override
   void dispose() {
     _permissionTimer?.cancel();
+    _batchTimer?.cancel();
+    _flushInputBatch();
     unawaited(_socket?.close());
     unawaited(_server?.close(force: true));
     super.dispose();
@@ -225,124 +258,194 @@ class _MacReceiverPageState extends State<MacReceiverPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Row(
+    return mac.MacosWindow(
+      titleBar: const mac.TitleBar(title: Text('PenBridge')),
+      sidebar: mac.Sidebar(
+        minWidth: 210,
+        startWidth: 230,
+        maxWidth: 300,
+        builder: (context, scrollController) => mac.SidebarItems(
+          currentIndex: _mode.index,
+          scrollController: scrollController,
+          itemSize: mac.SidebarItemSize.large,
+          onChanged: (index) => _selectMode(BridgeMode.values[index]),
+          items: [
+            for (final item in BridgeMode.values)
+              mac.SidebarItem(
+                leading: Icon(item.icon, size: 16),
+                label: Text(item.label),
+              ),
+          ],
+        ),
+        bottom: Padding(
+          padding: const EdgeInsets.all(12),
+          child: _StatusPill(active: _connected, label: _status),
+        ),
+      ),
+      child: mac.MacosScaffold(
+        backgroundColor: const Color(0xff17181d),
+        toolBar: mac.ToolBar(
+          title: Text('${_mode.label} modu'),
+          titleWidth: 180,
+          actions: [
+            mac.ToolBarIconButton(
+              label: 'USB bağlantısını hazırla',
+              icon: const mac.MacosIcon(CupertinoIcons.link),
+              showLabel: false,
+              onPressed: _prepareUsb,
+            ),
+          ],
+        ),
         children: [
-          _MacSidebar(mode: _mode, onMode: _selectMode),
-          Expanded(
-            child: Container(
-              color: const Color(0xff17181d),
-              child: Column(
-                children: [
-                  const _MacTitleBar(),
-                  Expanded(
-                    child: SingleChildScrollView(
-                      padding: const EdgeInsets.fromLTRB(32, 22, 32, 32),
-                      child: ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 1000),
+          mac.ContentArea(
+            builder: (context, scrollController) => Theme(
+              data: ThemeData.dark(useMaterial3: true),
+              child: Scaffold(
+                body: Row(
+                  children: [
+                    const SizedBox.shrink(),
+                    Expanded(
+                      child: Container(
+                        color: const Color(0xff17181d),
                         child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Row(
-                              children: [
-                                Expanded(
+                            const SizedBox.shrink(),
+                            Expanded(
+                              child: SingleChildScrollView(
+                                padding: const EdgeInsets.fromLTRB(
+                                  32,
+                                  22,
+                                  32,
+                                  32,
+                                ),
+                                child: ConstrainedBox(
+                                  constraints: const BoxConstraints(
+                                    maxWidth: 1000,
+                                  ),
                                   child: Column(
                                     crossAxisAlignment:
                                         CrossAxisAlignment.start,
                                     children: [
-                                      Text(
-                                        '${_mode.label} modu',
-                                        style: Theme.of(
-                                          context,
-                                        ).textTheme.headlineMedium,
+                                      Row(
+                                        children: [
+                                          Expanded(
+                                            child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  '${_mode.label} modu',
+                                                  style: Theme.of(
+                                                    context,
+                                                  ).textTheme.headlineMedium,
+                                                ),
+                                                const SizedBox(height: 6),
+                                                Text(
+                                                  _modeDescription(_mode),
+                                                  style: const TextStyle(
+                                                    color: Colors.white54,
+                                                    fontSize: 15,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                          _StatusPill(
+                                            active: _connected,
+                                            label: _status,
+                                          ),
+                                        ],
                                       ),
-                                      const SizedBox(height: 6),
-                                      Text(
-                                        _modeDescription(_mode),
-                                        style: const TextStyle(
-                                          color: Colors.white54,
-                                          fontSize: 15,
+                                      const SizedBox(height: 26),
+                                      Row(
+                                        children: [
+                                          Expanded(
+                                            child: _MacMetric(
+                                              icon: Icons.speed_rounded,
+                                              label: 'Paketler',
+                                              value: '$_packets',
+                                            ),
+                                          ),
+                                          const SizedBox(width: 12),
+                                          Expanded(
+                                            child: _PressureMetric(
+                                              value: _pressure,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 12),
+                                          Expanded(
+                                            child: _MacMetric(
+                                              icon: Icons.usb_rounded,
+                                              label: 'Bağlantı',
+                                              value: _usbStatus,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 18),
+                                      _MacCard(
+                                        title: 'Hızlı kurulum',
+                                        subtitle:
+                                            'Tablet ve Mac arasındaki kablolu bağlantıyı hazırla.',
+                                        child: Row(
+                                          children: [
+                                            Expanded(
+                                              child: _SetupRow(
+                                                number: '1',
+                                                title: 'Type-C tüneli',
+                                                detail: _usbStatus,
+                                                button: mac.PushButton(
+                                                  controlSize:
+                                                      mac.ControlSize.large,
+                                                  onPressed: _prepareUsb,
+                                                  child: const Text('Hazırla'),
+                                                ),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 12),
+                                            Expanded(
+                                              child: _SetupRow(
+                                                number: '2',
+                                                title: 'Mac giriş izni',
+                                                detail: _accessibility
+                                                    ? 'İzin verildi'
+                                                    : 'İzin gerekli',
+                                                button: _accessibility
+                                                    ? const Icon(
+                                                        Icons
+                                                            .check_circle_rounded,
+                                                        color:
+                                                            Colors.greenAccent,
+                                                        size: 26,
+                                                      )
+                                                    : mac.PushButton(
+                                                        controlSize: mac
+                                                            .ControlSize
+                                                            .large,
+                                                        onPressed:
+                                                            _requestPermission,
+                                                        child: const Text(
+                                                          'İzin ver',
+                                                        ),
+                                                      ),
+                                              ),
+                                            ),
+                                          ],
                                         ),
                                       ),
+                                      const SizedBox(height: 18),
+                                      _ModeHelp(mode: _mode),
                                     ],
                                   ),
                                 ),
-                                _StatusPill(active: _connected, label: _status),
-                              ],
-                            ),
-                            const SizedBox(height: 26),
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: _MacMetric(
-                                    icon: Icons.speed_rounded,
-                                    label: 'Paketler',
-                                    value: '$_packets',
-                                  ),
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: _PressureMetric(value: _pressure),
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: _MacMetric(
-                                    icon: Icons.usb_rounded,
-                                    label: 'Bağlantı',
-                                    value: _usbStatus,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 18),
-                            _MacCard(
-                              title: 'Hızlı kurulum',
-                              subtitle:
-                                  'Tablet ve Mac arasındaki kablolu bağlantıyı hazırla.',
-                              child: Row(
-                                children: [
-                                  Expanded(
-                                    child: _SetupRow(
-                                      number: '1',
-                                      title: 'Type-C tüneli',
-                                      detail: _usbStatus,
-                                      button: FilledButton(
-                                        onPressed: _prepareUsb,
-                                        child: const Text('Hazırla'),
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Expanded(
-                                    child: _SetupRow(
-                                      number: '2',
-                                      title: 'Mac giriş izni',
-                                      detail: _accessibility
-                                          ? 'İzin verildi'
-                                          : 'İzin gerekli',
-                                      button: _accessibility
-                                          ? const Icon(
-                                              Icons.check_circle_rounded,
-                                              color: Colors.greenAccent,
-                                              size: 26,
-                                            )
-                                          : OutlinedButton(
-                                              onPressed: _requestPermission,
-                                              child: const Text('İzin ver'),
-                                            ),
-                                    ),
-                                  ),
-                                ],
                               ),
                             ),
-                            const SizedBox(height: 18),
-                            _ModeHelp(mode: _mode),
                           ],
                         ),
                       ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),
@@ -435,22 +538,20 @@ class _TabletSenderPageState extends State<TabletSenderPage> {
       setState(() {});
     }
     _socket?.add(
-      jsonEncode({
-        'type': 'pointer',
-        'mode': _mode.id,
-        'tool': _tool.id,
-        'action': action,
-        'x': point.x,
-        'y': point.y,
-        'dx': position.dx - prior.dx,
-        'dy': position.dy - prior.dy,
-        'pressure': pressure,
-        'tilt': event.tilt,
-        'orientation': event.orientation,
-        'buttons': event.buttons,
-        'inverted': event.kind == PointerDeviceKind.invertedStylus,
-        'time': micros,
-      }),
+      _encodePointer(
+        mode: _mode,
+        tool: _tool,
+        action: action,
+        x: point.x,
+        y: point.y,
+        dx: position.dx - prior.dx,
+        dy: position.dy - prior.dy,
+        pressure: pressure,
+        tilt: event.tilt,
+        orientation: event.orientation,
+        buttons: event.buttons,
+        inverted: event.kind == PointerDeviceKind.invertedStylus,
+      ),
     );
   }
 
@@ -586,107 +687,6 @@ class _TabletSenderPageState extends State<TabletSenderPage> {
     BridgeMode.trackpad => 'Kalemi göreceli imleç olarak kullan',
     BridgeMode.blender => 'Üst araç çubuğundan 3D kontrolünü seç',
   };
-}
-
-class _MacSidebar extends StatelessWidget {
-  const _MacSidebar({required this.mode, required this.onMode});
-  final BridgeMode mode;
-  final ValueChanged<BridgeMode> onMode;
-  @override
-  Widget build(BuildContext context) => Container(
-    width: 236,
-    decoration: const BoxDecoration(
-      color: Color(0xff101116),
-      border: Border(right: BorderSide(color: Colors.white10)),
-    ),
-    padding: const EdgeInsets.fromLTRB(14, 48, 14, 18),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 10),
-          child: Row(
-            children: [
-              _BrandMark(),
-              SizedBox(width: 11),
-              Expanded(
-                child: Text(
-                  'PenBridge',
-                  maxLines: 1,
-                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 34),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 10),
-          child: Text('MODLAR', style: _eyebrow),
-        ),
-        const SizedBox(height: 8),
-        for (final item in BridgeMode.values)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 4),
-            child: Material(
-              color: item == mode
-                  ? Colors.white.withValues(alpha: .09)
-                  : Colors.transparent,
-              borderRadius: BorderRadius.circular(9),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(9),
-                onTap: () => onMode(item),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 11,
-                    vertical: 10,
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(
-                        item.icon,
-                        size: 18,
-                        color: item == mode
-                            ? const Color(0xffb6a8ff)
-                            : Colors.white54,
-                      ),
-                      const SizedBox(width: 11),
-                      Text(item.label),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        const Spacer(),
-        const Padding(
-          padding: EdgeInsets.all(10),
-          child: Text(
-            'USB • Yerel • Açık kaynak',
-            style: TextStyle(color: Colors.white30, fontSize: 12),
-          ),
-        ),
-      ],
-    ),
-  );
-}
-
-class _MacTitleBar extends StatelessWidget {
-  const _MacTitleBar();
-  @override
-  Widget build(BuildContext context) => Container(
-    height: 52,
-    decoration: const BoxDecoration(
-      color: Color(0xff17181d),
-      border: Border(bottom: BorderSide(color: Colors.white10)),
-    ),
-    alignment: Alignment.centerRight,
-    padding: const EdgeInsets.symmetric(horizontal: 18),
-    child: const Text(
-      'Galaxy Tab → Mac',
-      style: TextStyle(color: Colors.white38, fontSize: 12),
-    ),
-  );
 }
 
 class _MacCard extends StatelessWidget {
@@ -1122,6 +1122,44 @@ String _modeDescription(BridgeMode mode) => switch (mode) {
   BridgeMode.blender =>
     'Sculpt, Grease Pencil, orbit, pan ve zoom için hazır Blender profili.',
 };
+
+Uint8List _encodePointer({
+  required BridgeMode mode,
+  required BlenderTool tool,
+  required String action,
+  required double x,
+  required double y,
+  required double dx,
+  required double dy,
+  required double pressure,
+  required double tilt,
+  required double orientation,
+  required int buttons,
+  required bool inverted,
+}) {
+  final bytes = Uint8List(40);
+  final data = ByteData.sublistView(bytes);
+  bytes[0] = 1;
+  bytes[1] = mode.index;
+  bytes[2] = tool.index;
+  bytes[3] = switch (action) {
+    'down' => 1,
+    'drag' => 2,
+    'up' => 3,
+    _ => 0,
+  };
+  data
+    ..setFloat32(4, x, Endian.little)
+    ..setFloat32(8, y, Endian.little)
+    ..setFloat32(12, dx, Endian.little)
+    ..setFloat32(16, dy, Endian.little)
+    ..setFloat32(20, pressure, Endian.little)
+    ..setFloat32(24, tilt, Endian.little)
+    ..setFloat32(28, orientation, Endian.little)
+    ..setInt32(32, buttons, Endian.little);
+  bytes[36] = inverted ? 1 : 0;
+  return bytes;
+}
 
 const _eyebrow = TextStyle(
   color: Colors.white38,

@@ -19,6 +19,13 @@ final class MainFlutterWindow: NSWindow {
     channel = FlutterMethodChannel(name: "io.penbridge/input", binaryMessenger: controller.engine.binaryMessenger)
     channel?.setMethodCallHandler { [weak self] call, result in
       switch call.method {
+      case "injectBatch":
+        guard let typedData = call.arguments as? FlutterStandardTypedData else {
+          result(FlutterError(code: "bad_batch", message: "Invalid input batch", details: nil))
+          return
+        }
+        self?.injectBatch(typedData.data)
+        result(nil)
       case "injectInput":
         guard let packet = call.arguments as? [String: Any] else {
           result(FlutterError(code: "bad_packet", message: "Invalid input packet", details: nil))
@@ -46,6 +53,47 @@ final class MainFlutterWindow: NSWindow {
       _ = AXIsProcessTrustedWithOptions(options)
     }
     super.awakeFromNib()
+  }
+
+  private func injectBatch(_ data: Data) {
+    let bytes = [UInt8](data)
+    guard bytes.count >= 40 else { return }
+    let modes = ["pen", "mouse", "trackpad", "blender"]
+    let tools = ["draw", "orbit", "pan", "zoom"]
+    let actions = ["hover", "down", "drag", "up"]
+
+    func float(at offset: Int) -> Double {
+      let bits = UInt32(bytes[offset])
+        | UInt32(bytes[offset + 1]) << 8
+        | UInt32(bytes[offset + 2]) << 16
+        | UInt32(bytes[offset + 3]) << 24
+      return Double(Float(bitPattern: bits))
+    }
+
+    for base in stride(from: 0, through: bytes.count - 40, by: 40) {
+      guard bytes[base] == 1 else { continue }
+      let modeIndex = min(Int(bytes[base + 1]), modes.count - 1)
+      let toolIndex = min(Int(bytes[base + 2]), tools.count - 1)
+      let actionIndex = min(Int(bytes[base + 3]), actions.count - 1)
+      let buttonBits = UInt32(bytes[base + 32])
+        | UInt32(bytes[base + 33]) << 8
+        | UInt32(bytes[base + 34]) << 16
+        | UInt32(bytes[base + 35]) << 24
+      inject([
+        "action": actions[actionIndex],
+        "mode": modes[modeIndex],
+        "tool": tools[toolIndex],
+        "x": float(at: base + 4),
+        "y": float(at: base + 8),
+        "dx": float(at: base + 12),
+        "dy": float(at: base + 16),
+        "pressure": float(at: base + 20),
+        "tilt": float(at: base + 24),
+        "orientation": float(at: base + 28),
+        "buttons": Int64(Int32(bitPattern: buttonBits)),
+        "inverted": bytes[base + 36] == 1,
+      ])
+    }
   }
 
   private func inject(_ packet: [String: Any]) {

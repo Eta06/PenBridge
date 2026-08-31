@@ -9,7 +9,10 @@ Blender, drawing tools and other tablet-aware Mac applications.
 
 - The Android app reads native Flutter stylus pointer events.
 - `adb reverse` carries the local WebSocket stream over USB; no Wi-Fi is used.
-- The macOS app converts packets into Quartz tablet/mouse events.
+- Pointer traffic uses fixed 40-byte binary packets and a 4 ms native micro-batch
+  instead of per-event JSON decoding.
+- The macOS app converts packets into Quartz tablet/mouse events and uses native
+  `macos_ui` window, toolbar, sidebar and button components.
 
 ## Input modes
 
@@ -53,7 +56,8 @@ entry, sign the app with your Apple Development certificate or add the built
 ## Current limitations
 
 - Coordinates map the complete tablet pad to the Mac's main display.
-- The MVP uses JSON/WebSocket packets; a compact binary protocol is planned.
+- Mode synchronization uses tiny JSON control messages; the high-rate pointer
+  stream is binary.
 - Quartz tablet-event compatibility varies by application. A DriverKit virtual
   HID backend is planned, but distribution requires an Apple entitlement.
 - USB debugging is required for this first version. Android Open Accessory mode
